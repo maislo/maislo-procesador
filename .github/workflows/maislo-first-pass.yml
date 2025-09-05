@@ -1,0 +1,221 @@
+name: Maislo First Pass (single file)
+
+on:
+  workflow_dispatch: {}            # botón “Run workflow”
+  schedule:
+    - cron: "*/30 * * * *"         # cada 30 min (UTC) mientras dura la primera pasada
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Run first pass (FAST, marca persistente)
+        env:
+          SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
+          SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
+          SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
+          RATE_LIMIT_SLEEP: "1.0"        # sube a 1.2 si ves muchos 429
+          PASS_MARK: "first-pass"        # marca para saltar lo ya procesado
+          SHOW_EVERY_ITEM: "1"           # imprime una línea por producto
+        run: |
+          python - << 'PY'
+          import os, re, time, html, unicodedata, requests
+          from datetime import datetime, timezone
+
+          SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
+          TOKEN = os.environ["SHOP_TOKEN"]
+          API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
+          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.0"))
+          SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
+          PASS_MARK = os.environ.get("PASS_MARK","").strip()
+
+          S = requests.Session()
+          S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type":"application/json","Accept":"application/json"})
+
+          def req(m,u,**k):
+            tries=0
+            while True:
+              r = S.request(m,u,timeout=60,**k)
+              if r.status_code==429:
+                tries+=1
+                time.sleep(max(1.0,RATE_LIMIT_SLEEP))
+                if tries<8: continue
+                return r
+              bucket=r.headers.get("X-Shopify-Shop-Api-Call-Limit","")
+              try:
+                used,total=[int(x) for x in bucket.split("/")]
+                if used>=total-4: time.sleep(1.0)
+              except: pass
+              time.sleep(RATE_LIMIT_SLEEP)
+              return r
+
+          def next_page_info(resp):
+            link = resp.headers.get("Link","")
+            m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
+            return m.group(1) if m else None
+
+          TAG_RE = re.compile(r"<[^>]+>")
+          def html_to_text(s):
+            if not s: return ""
+            s = html.unescape(s); s = TAG_RE.sub(" ", s)
+            return re.sub(r"\s{2,}"," ", s).strip()
+
+          def strip_accents(s): 
+            return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
+
+          def normalize_brand(v):
+            if not v: return ""
+            v=re.sub(r"\s{2,}"," ",v.strip())
+            if v.isupper() and len(v)<=6: return v
+            return " ".join([p.capitalize() if p.islower() else p for p in v.split(" ")])
+
+          COLOR_MAP={"negro":"Black","noir":"Black","black":"Black","nero":"Black","blanco":"White","bianco":"White","white":"White","gris":"Gray","grigio":"Gray","grey":"Gray","azul":"Blue","blu":"Blue","bleu":"Blue","rojo":"Red","rosso":"Red","rouge":"Red","verde":"Green","vert":"Green","amarillo":"Yellow","giallo":"Yellow","jaune":"Yellow","naranja":"Orange","arancione":"Orange","marron":"Brown","marrón":"Brown","marrone":"Brown","beige":"Beige","rosa":"Pink","rose":"Pink","fucsia":"Pink","morado":"Purple","viola":"Purple","multicolor":"Multicolor","multi":"Multicolor","varios":"Multicolor"}
+          def normalize_color(v):
+            if not v: return ""
+            vl=strip_accents(v.strip().lower())
+            for t in re.split(r"[\/,\-\s]+",vl):
+              if t in COLOR_MAP: return COLOR_MAP[t]
+            return v.strip().title()
+
+          def extract_color_from_options(p):
+            for opt in p.get("options",[]):
+              name=(opt.get("name") or "").lower()
+              if name in ("color","colour","couleur","colore","coloris"):
+                vals=opt.get("values") or []
+                if vals: return vals[0]
+            return ""
+
+          def guess_gender(tags):
+            t=(tags or "").lower()
+            if any(x in t for x in ["mujer","women","femme","lady"]): return "Mujer"
+            if any(x in t for x in ["hombre","men","homme"]): return "Hombre"
+            if "niña" in t or "girl" in t: return "Niña"
+            if "niño" in t or "boy" in t: return "Niño"
+            return "Unisex"
+
+          KW={
+            "perfumes":["perfume","fragancia","colonia","eau de parfum","eau de toilette","edp","edt","after shave","aftershave","parfum","fragrance","cologne"],
+            "calzado":["zapat","zapato","bota","botin","sandalia","chancla","mocasin","zueco","alpargata","tacon","sneaker","shoe","boot","sandal","loafer","derby","oxford","heel","pump","trainer","chaussure","botte","sandale","mocassin","stivale","scarpa","sandalo"],
+            "bolsos":["bolso","mochila","bandolera","riñonera","rinonera","tote","shopper","clutch","satchel","hobo","bag","backpack","crossbody","handbag","pouch","sac","pochette"],
+            "relojes":["reloj","cronografo","smartwatch","analogico","digital","watch","wristwatch","chronograph","montre","chronographe"],
+            "complementos":["cinturon","cinturón","bufanda","foulard","pañuelo","gorra","sombrero","guante","gafas","sunglasses","cartera","wallet","corbata","tie","pajarita","calcetin","calcetines","medias","diadema","paraguas","umbrella"],
+            "ropa":["camiseta","camisa","polo","jersey","sudadera","pantal","pantalon","vaquero","jean","denim","falda","vestido","short","chaqueta","abrigo","chaleco","mono","top","blusa","leggings","pijama","lenceria","bañador","bikini","parka","trench","blazer","jacket","coat","dress","skirt","hoodie","t-shirt"],
+            "hogar":["hogar","home","bedding","toalla","sabana","sábana","funda","cojin","cojín","edredon","colcha","almohada","manta","cortina","alfombra","duvet","pillow","blanket","curtain","rug"]
+          }
+          NEG={"relojes":["correa","strap","band"],"bolsos":["wallet","cartera"]}
+
+          def detect_category(ptype,tags,title):
+            t=strip_accents(" ".join([ptype or "",tags or "",title or ""]).lower())
+            order=["perfumes","calzado","bolsos","relojes","complementos","ropa","hogar"]
+            for cat in order:
+              kws=[strip_accents(x) for x in KW[cat]]
+              if any(k in t for k in kws):
+                if any(strip_accents(n) in t for n in NEG.get(cat,[])): continue
+                return cat
+            return "otros"
+
+          def mf(owner_resource, owner_id, namespace, key, value, value_type="single_line_text_field"):
+            if value in (None,"",[]): return
+            if isinstance(value,(int,float)): value_type="number_decimal"; value=str(value)
+            elif isinstance(value,str) and (len(value)>200 or "\n" in value): value_type="multi_line_text_field"
+            url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
+            payload={"metafield":{"namespace":namespace,"key":key,"value":value,"type":value_type,"owner_resource":owner_resource,"owner_id":owner_id}}
+            r=req("POST",url,json=payload)
+            if not r.ok and r.status_code!=422:
+              print("metafield error",owner_resource,owner_id,namespace,key,r.status_code,r.text)
+
+          def put_product(pid, payload):
+            url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}.json"
+            r=req("PUT",url,json={"product":payload})
+            if not r.ok: print("update product error",pid,r.status_code,r.text)
+
+          def get_mfs(pid):
+            url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}/metafields.json"
+            r=req("GET",url)
+            d={}
+            if r.ok:
+              for m in r.json().get("metafields",[]): d[f"{m.get('namespace')}.{m.get('key')}"]=m.get("value") or ""
+            return d
+
+          processed=0
+          page_info=None
+
+          while True:
+            base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250&status=any"
+            url = base
+            if page_info: url+=f"&page_info={page_info}"
+            r=req("GET",url)
+            prods=r.json().get("products",[])
+            if not prods and page_info is None:
+              base2=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250"
+              r2=req("GET",base2); prods=r2.json().get("products",[])
+              print(f"Reintento sin 'status': {len(prods)} productos", flush=True)
+            if not prods: break
+            print(f"Página cargada: {len(prods)} productos", flush=True)
+
+            for p in prods:
+              pid=p["id"]
+              metas=get_mfs(pid)
+              if PASS_MARK and (metas.get("custom.processed_pass") or "")==PASS_MARK:
+                if SHOW_EVERY_ITEM: print(f"SKIP pid={pid} (ya marcado)", flush=True)
+                continue
+
+              vendor=normalize_brand(p.get("vendor") or "")
+              title=p.get("title") or ""
+              tags=p.get("tags") or ""
+              gender=guess_gender(tags)
+              color_opt=extract_color_from_options(p)
+              ptype=p.get("product_type") or ""
+
+              if vendor: mf("product",pid,"custom","brand",vendor)
+              model=title.strip()
+              if vendor and model.lower().startswith(vendor.lower()): model=model[len(vendor):].strip()
+              if vendor: model=re.sub(re.escape(vendor), "", model, flags=re.I).strip()
+              model=re.sub(r"\s{2,}"," ",model) or title
+              mf("product",pid,"custom","model",model)
+              mf("product",pid,"custom","gender",gender)
+
+              body_html = p.get("body_html") or ""
+              orig_html = metas.get("custom.original_description","")
+              tech_source = orig_html if (orig_html and orig_html.strip()) else body_html
+              tech_text = html_to_text(tech_source)
+              if tech_text: mf("product",pid,"custom","tech_description",tech_text,"multi_line_text_field")
+
+              existing = (metas.get("custom.category") or "").strip()
+              cat = strip_accents(existing).lower() if existing else detect_category(ptype,tags,title)
+              mf("product",pid,"custom","category",(cat or "otros").capitalize())
+
+              c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
+              g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
+              b = vendor or "Maislo"; m=model or "Producto"
+              if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
+              elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
+              elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
+              elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
+              elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
+              elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
+              elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
+              else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
+              body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
+              put_product(pid,{"id":pid,"body_html":body})
+
+              if color_opt: mf("product",pid,"custom","color",normalize_color(color_opt))
+              if PASS_MARK: mf("product",pid,"custom","processed_pass",PASS_MARK)
+
+              processed+=1
+              if SHOW_EVERY_ITEM: print(f"#{processed} PID={pid} Procesados: {processed}", flush=True)
+
+            page_info = next_page_info(r)
+            if not page_info: break
+
+          print(f"Processed products (esta sesión): {processed}", flush=True)
+          PY
