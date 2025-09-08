@@ -1,9 +1,9 @@
-name: Maislo Full Pass (ALL + Variants)
+name: Maislo Full Pass (ALL + Variants, fixed metafield types)
 
 on:
-  workflow_dispatch: {}            # botón “Run workflow”
+  workflow_dispatch: {}
   schedule:
-    - cron: "*/30 * * * *"         # cada 30 min (UTC) hasta terminar la primera pasada
+    - cron: "*/30 * * * *"
 
 jobs:
   run:
@@ -23,17 +23,16 @@ jobs:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
-          RATE_LIMIT_SLEEP: "1.0"      # si ves 429, sube a 1.2
-          PROGRESS_EVERY: "25"         # print cada 25
-          SHOW_EVERY_ITEM: "0"         # "1" para imprimir cada producto
-          PASS_MARK: "full-pass-1"     # marca persistente (product.metafields.custom.processed_pass)
-          FORCE_REPROCESS: "1"         # "1" = ignora marcas previas y reprocesa TODO en esta primera pasada
+          RATE_LIMIT_SLEEP: "1.0"
+          PROGRESS_EVERY: "25"
+          SHOW_EVERY_ITEM: "0"
+          PASS_MARK: "full-pass-1"
+          FORCE_REPROCESS: "1"
         run: |
           python - << 'PY'
           import os, re, time, html, unicodedata, requests
           from datetime import datetime, timezone
 
-          # ===== Config =====
           SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
           TOKEN = os.environ["SHOP_TOKEN"]
           API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
@@ -46,7 +45,7 @@ jobs:
           S = requests.Session()
           S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type":"application/json","Accept":"application/json"})
 
-          # ===== Utils =====
+          # ---------- HTTP helpers ----------
           def req(m,u,**k):
             tries=0
             while True:
@@ -71,10 +70,11 @@ jobs:
               return r
 
           def next_page_info(resp):
-            link = resp.headers.get("Link","")
-            m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link or "")
+            link = resp.headers.get("Link","") or ""
+            m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
             return m.group(1) if m else None
 
+          # ---------- Text utils ----------
           TAG_RE = re.compile(r"<[^>]+>")
           def html_to_text(s):
             if not s: return ""
@@ -84,6 +84,7 @@ jobs:
           def strip_accents(s): 
             return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
 
+          # ---------- Normalizers ----------
           def normalize_brand(v):
             if not v: return ""
             v=re.sub(r"\s{2,}"," ",v.strip())
@@ -135,33 +136,59 @@ jobs:
                 return cat
             return "otros"
 
-          # --- Metafields helpers (upsert PRODUCTO) ---
+          # ---------- Metafields helpers ----------
+          # Tipos forzados por clave (para coincidir con tus definiciones de Shopify)
+          PRODUCT_META_TYPE = {
+            ("custom","brand"): "single_line_text_field",
+            ("custom","model"): "single_line_text_field",
+            ("custom","gender"): "single_line_text_field",
+            ("custom","category"): "single_line_text_field",
+            ("custom","color"): "single_line_text_field",
+            ("custom","tech_description"): "multi_line_text_field",
+            ("custom","processed_pass"): "single_line_text_field",
+          }
+
+          def sanitize_for_type(value, mf_type):
+            if value is None: return value
+            if mf_type == "single_line_text_field" and isinstance(value, str):
+              v = re.sub(r"\s+", " ", value).strip()
+              # por seguridad, cortamos a 255 chars
+              return v[:255]
+            if mf_type == "number_decimal":
+              try: return str(float(value))
+              except: return None
+            return value
+
           def get_product_metafields(pid):
             url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}/metafields.json"
             r=req("GET",url)
             d={}
             if r.ok:
               for m in r.json().get("metafields",[]):
-                d[f"{m.get('namespace')}.{m.get('key')}"]={"id":m.get("id"),"value":m.get("value")}
+                d[f"{m.get('namespace')}.{m.get('key')}"]={"id":m.get("id"),"value":m.get("value"),"type":m.get("type")}
             return d
 
           def upsert_product_metafield(pid, namespace, key, value):
-            if value in (None,"",[]): return
-            value_type="single_line_text_field"
-            if isinstance(value,(int,float)): value_type="number_decimal"; value=str(value)
-            elif isinstance(value,str) and (len(value)>200 or "\n" in value): value_type="multi_line_text_field"
             metas=get_product_metafields(pid)
             existing=metas.get(f"{namespace}.{key}")
+            # decide type: existing type or forced by map
+            desired_type = (existing or {}).get("type") or PRODUCT_META_TYPE.get((namespace,key)) or "single_line_text_field"
+            value = sanitize_for_type(value, desired_type)
+            if value in (None,"",[]): return
+
             if existing and existing.get("id"):
               mid=existing["id"]
               url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields/{mid}.json"
-              payload={"metafield":{"id":mid,"value":value,"type":value_type}}
+              payload={"metafield":{"id":mid,"value":value}}
+              # si la API exige type, lo ponemos igual que existing
+              if existing.get("type"): payload["metafield"]["type"]=existing["type"]
               r=req("PUT",url,json=payload)
               if not r.ok: print("metafield PUT error",pid,namespace,key,r.status_code,r.text)
               return
+
             url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
             payload={"metafield":{
-              "namespace":namespace,"key":key,"value":value,"type":value_type,
+              "namespace":namespace,"key":key,"value":value,"type":desired_type,
               "owner_resource":"product","owner_id":pid
             }}
             r=req("POST",url,json=payload)
@@ -184,12 +211,24 @@ jobs:
               tags_list.append(tag)
               put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
 
-          # ===== Conteo total =====
-          rc = req("GET", f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any&published_status=any")
-          if rc.ok:
-            print("Conteo total (published+unpublished):", rc.json().get("count"), flush=True)
-          else:
-            print("No se pudo obtener conteo total:", rc.status_code, rc.text, flush=True)
+          # ---------- Conteo (robusto) ----------
+          def try_count():
+            urls=[
+              f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any&published_status=any",
+              f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any",
+              f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json"
+            ]
+            for u in urls:
+              r=req("GET",u)
+              if r.ok:
+                try:
+                  c=int(r.json().get("count",0))
+                  if c>=0: return c
+                except: pass
+            return 0
+
+          total = try_count()
+          print("Conteo total (aprox.):", total, flush=True)
 
           processed=0
           skipped=0
@@ -226,7 +265,6 @@ jobs:
               color_opt=extract_color_from_options(p)
               metas=get_product_metafields(pid)
 
-              # Saltar si ya marcado y NO forzamos reproceso
               if PASS_MARK and (metas.get("custom.processed_pass") or {}).get("value")==PASS_MARK and not FORCE_REPROCESS:
                 skipped+=1
                 if SHOW_EVERY_ITEM: print(f"SKIP pid={pid} (ya marcado {PASS_MARK})", flush=True)
@@ -234,7 +272,7 @@ jobs:
 
               gender=guess_gender(tags)
 
-              # --- Metacampos producto ---
+              # --- PRODUCT metafields (tipos forzados) ---
               if vendor: upsert_product_metafield(pid, "custom", "brand", vendor)
 
               model=title.strip()
@@ -244,7 +282,6 @@ jobs:
               upsert_product_metafield(pid, "custom", "model", model)
               upsert_product_metafield(pid, "custom", "gender", gender)
 
-              # Ficha técnica
               body_html = p.get("body_html") or ""
               orig_html = (metas.get("custom.original_description") or {}).get("value") or ""
               tech_source = orig_html if orig_html.strip() else body_html
@@ -252,16 +289,14 @@ jobs:
               if tech_text:
                 upsert_product_metafield(pid, "custom", "tech_description", tech_text)
 
-              # Categoría
               existing = ((metas.get("custom.category") or {}).get("value") or "").strip()
               cat = strip_accents(existing).lower() if existing else detect_category(ptype,tags,title)
               upsert_product_metafield(pid, "custom", "category", (cat or "otros").capitalize())
 
-              # Color
               if color_opt:
                 upsert_product_metafield(pid, "custom", "color", normalize_color(color_opt))
 
-              # Descripción de marketing (body_html)
+              # Body marketing
               c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
               g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
               b = vendor or "Maislo"; m=model or "Producto"
@@ -276,7 +311,7 @@ jobs:
               body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
               put_product(pid,{"id":pid,"body_html":body})
 
-              # --- Variantes ---
+              # --- VARIANTES ---
               total_inventory=0
               for v in p.get("variants", []):
                 inv = v.get("inventory_quantity")
@@ -287,7 +322,7 @@ jobs:
                 barcode = v.get("barcode") or ""
                 sku = v.get("sku") or ""
 
-                # Limpieza compare_at y msrp
+                # compare_at / msrp
                 if cap not in (None,""):
                   try:
                     capf=float(cap)
@@ -302,6 +337,7 @@ jobs:
                   except Exception:
                     pass
 
+                # EAN / MPN
                 if barcode:
                   mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
                   payload={"metafield":{"namespace":"custom","key":"ean","value":barcode,"type":"single_line_text_field","owner_resource":"variant","owner_id":vid}}
@@ -315,11 +351,9 @@ jobs:
                   if not rr.ok and rr.status_code!=422:
                     print("metafield variant mpn error",vid,rr.status_code,rr.text)
 
-              # Últimas unidades
               if total_inventory <= 2:
                 add_tag_if_missing(pid, tags, "last-units")
 
-              # Marca de pasada
               if PASS_MARK:
                 upsert_product_metafield(pid, "custom", "processed_pass", PASS_MARK)
 
