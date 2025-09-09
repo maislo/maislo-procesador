@@ -1,9 +1,13 @@
-name: Maislo First Pass (repair all)
+name: Maislo First Pass (repair all, robust pagination)
 
 on:
-  workflow_dispatch: {}        # lo lanzas a mano
+  workflow_dispatch: {}
   schedule:
-    - cron: "*/30 * * * *"     # opcional: cada 30' hasta completar la primera pasada
+    - cron: "*/30 * * * *"     # opcional durante la primera pasada
+
+concurrency:
+  group: maislo-jobs
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -18,16 +22,16 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Run FIRST PASS (products + variants, compact+dedup)
+      - name: Run FIRST PASS (products + variants)
         env:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
-          RATE_LIMIT_SLEEP: "1.6"      # sube a 1.8 si ves 429
-          PROGRESS_EVERY: "50"         # print cada 50 productos
-          SHOW_EVERY_ITEM: "0"         # "1" para ver cada producto en logs
-          PASS_MARK: "full-pass-2"     # marca para esta pasada reparadora
-          FORCE_REPROCESS: "1"         # 1 = rehace TODO
+          RATE_LIMIT_SLEEP: "1.7"
+          PROGRESS_EVERY: "50"
+          SHOW_EVERY_ITEM: "0"
+          PASS_MARK: "full-pass-2"
+          FORCE_REPROCESS: "1"
         run: |
           python - << 'PY'
           import os, re, time, html, unicodedata, requests
@@ -36,7 +40,7 @@ jobs:
           SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
           TOKEN = os.environ["SHOP_TOKEN"]
           API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
-          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.6"))
+          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.7"))
           PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY","50"))
           SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
           PASS_MARK = os.environ.get("PASS_MARK","").strip()
@@ -45,14 +49,14 @@ jobs:
           S = requests.Session()
           S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type":"application/json","Accept":"application/json"})
 
-          # ---------- HTTP ----------
+          # ---------- HTTP helpers ----------
           def req(m,u,**k):
             tries=0
             while True:
               r = S.request(m,u,timeout=60,**k)
               if r.status_code==429:
                 tries+=1
-                wait = max(1.0, RATE_LIMIT_SLEEP)
+                wait = max(1.2, RATE_LIMIT_SLEEP)
                 ra = r.headers.get("Retry-After")
                 if ra:
                   try: wait = max(wait, float(ra))
@@ -73,7 +77,7 @@ jobs:
             m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
             return m.group(1) if m else None
 
-          # ---------- Texto / Parse ----------
+          # ---------- Texto utilidades ----------
           TAG_RE = re.compile(r"<[^>]+>")
           def strip_accents(s): 
             return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
@@ -214,27 +218,20 @@ jobs:
             desired_type = (existing or {}).get("type") or PRODUCT_META_TYPE.get((namespace,key)) or "single_line_text_field"
             value = sanitize_for_type(value, desired_type)
             if value in (None,"",[]): return
-
-            # Evita PUT si el valor ya es idéntico (ignorando espacios múltiples)
             existing_val = (existing or {}).get("value")
             if isinstance(existing_val,str) and isinstance(value,str):
               a = re.sub(r'\s+',' ', existing_val).strip()
               b = re.sub(r'\s+',' ', value).strip()
-              if a == b:
-                return
-
+              if a == b: return
             if existing and existing.get("id"):
               mid=existing["id"]
               url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields/{mid}.json"
               payload={"metafield":{"id":mid,"value":value}}
               if existing.get("type"): payload["metafield"]["type"]=existing["type"]
               r=req("PUT",url,json=payload)
-              if not r.ok:
-                print("metafield PUT error",pid,namespace,key,r.status_code,r.text)
-              else:
-                metas[f"{namespace}.{key}"]["value"]=value
+              if not r.ok: print("metafield PUT error",pid,namespace,key,r.status_code,r.text)
+              else: metas[f"{namespace}.{key}"]["value"]=value
               return
-
             url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
             payload={"metafield":{
               "namespace":namespace,"key":key,"value":value,"type":desired_type,
@@ -262,7 +259,7 @@ jobs:
               tags_list.append(tag)
               put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
 
-          # ---------- Conteo ----------
+          # ---------- Conteo aprox ----------
           def try_count():
             urls=[
               f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any&published_status=any",
@@ -272,34 +269,47 @@ jobs:
             for u in urls:
               r=req("GET",u)
               if r.ok:
-                try:
-                  return int(r.json().get("count",0))
+                try: return int(r.json().get("count",0))
                 except: pass
             return 0
 
           total = try_count()
           print("Conteo total (aprox.):", total, flush=True)
 
-          processed=0; skipped=0; page_info=None; page_no=0; start=time.time()
+          processed=0; skipped=0; page_no=0
+          page_info=None
+          mode="page_info"   # cambiará a "since" si no hay Link y aún hay más
+          since_id=None
+
+          def fetch_page(page_info=None, since_id=None, mode="page_info", attempt_no=1):
+            base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250"
+            if mode=="page_info":
+              url=base+"&status=any&published_status=any"
+              if page_info: url += f"&page_info={page_info}"
+            else:
+              url=base+"&status=any&published_status=any&order=id%20asc"
+              if since_id: url += f"&since_id={since_id}"
+            r=req("GET",url); prods=[]
+            if r.ok:
+              prods=r.json().get("products",[])
+            if not prods and attempt_no==1:
+              # Reintento sin 'status' (algunas tiendas no devuelven nada con status=any)
+              if mode=="page_info":
+                url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250" + (f"&page_info={page_info}" if page_info else "")
+              else:
+                url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250&order=id%20asc" + (f"&since_id={since_id}" if since_id else "")
+              r=req("GET",url)
+              if r.ok:
+                prods=r.json().get("products",[])
+            return r, prods
 
           while True:
-            base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250&status=any&published_status=any"
-            url = base + (f"&page_info={page_info}" if page_info else "")
-            r=req("GET",url)
-            if not r.ok:
-              print("Fetch error:", r.status_code, r.text, flush=True); break
-
-            prods=r.json().get("products",[])
-            if not prods and page_info is None:
-              base2=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250&published_status=any"
-              r2=req("GET",base2)
-              prods=r2.json().get("products",[]) if r2.ok else []
-              print(f"Reintento sin 'status': {len(prods)} productos", flush=True)
+            r, prods = fetch_page(page_info=page_info, since_id=since_id, mode=mode)
             if not prods:
               print("No hay más productos.", flush=True); break
 
             page_no += 1
-            print(f"[Página {page_no}] cargada: {len(prods)} productos", flush=True)
+            print(f"[Página {page_no} • modo={mode}] cargada: {len(prods)} productos", flush=True)
 
             for p in prods:
               pid=p["id"]
@@ -315,9 +325,29 @@ jobs:
                 if SHOW_EVERY_ITEM: print(f"SKIP pid={pid} (ya marcado {PASS_MARK})", flush=True)
                 continue
 
-              gender=guess_gender(tags)
+              # ----- rellenado de metacampos y variantes (igual que tenías) -----
+              def html_to_text_lines_compact(source):
+                lines = html_to_lines(source)
+                return compact_kv(lines)
 
-              # --- PRODUCT METAFIELDS ---
+              def normalize_body_and_put(cat, vendor, model, color_opt, gender, p):
+                c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
+                g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
+                b = vendor or "Maislo"; m=model or "Producto"
+                if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
+                elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
+                elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
+                elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
+                elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
+                elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
+                elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
+                else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
+                new_body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
+                current_body = (p.get("body_html") or "").strip()
+                if current_body != new_body.strip():
+                  put_product(pid,{"id":pid,"body_html":new_body})
+
+              gender = guess_gender(tags)
               if vendor: upsert_product_metafield_cached(pid, metas, "custom", "brand", vendor)
 
               model=title.strip()
@@ -327,16 +357,13 @@ jobs:
               upsert_product_metafield_cached(pid, metas, "custom", "model", model)
               upsert_product_metafield_cached(pid, metas, "custom", "gender", gender)
 
-              # ---- Ficha técnica (compactada + dedup) ----
               body_html = p.get("body_html") or ""
               orig_html = (metas.get("custom.original_description") or {}).get("value") or ""
               tech_source = orig_html if orig_html.strip() else body_html
-              lines = html_to_lines(tech_source)
-              tech_compact = compact_kv(lines)
+              tech_compact = html_to_text_lines_compact(tech_source)
               if tech_compact:
                 upsert_product_metafield_cached(pid, metas, "custom", "tech_description", tech_compact)
 
-              # Categoría
               existing = ((metas.get("custom.category") or {}).get("value") or "").strip()
               cat = strip_accents(existing).lower() if existing else detect_category(ptype,tags,title)
               upsert_product_metafield_cached(pid, metas, "custom", "category", (cat or "otros").capitalize())
@@ -344,24 +371,8 @@ jobs:
               if color_opt:
                 upsert_product_metafield_cached(pid, metas, "custom", "color", normalize_color(color_opt))
 
-              # Body marketing breve (solo si cambia, para no tocar updated_at)
-              c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
-              g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
-              b = vendor or "Maislo"; m=model or "Producto"
-              if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
-              elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
-              elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
-              elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
-              elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
-              elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
-              elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
-              else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
-              new_body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
-              current_body = (p.get("body_html") or "").strip()
-              if current_body != new_body.strip():
-                put_product(pid,{"id":pid,"body_html":new_body})
+              normalize_body_and_put(cat, vendor, model, color_opt, gender, p)
 
-              # --- VARIANTES ---
               total_inventory=0
               for v in p.get("variants", []):
                 inv = v.get("inventory_quantity")
@@ -412,13 +423,28 @@ jobs:
               if SHOW_EVERY_ITEM:
                 print(f"#{processed} PID={pid} Procesados: {processed}", flush=True)
               elif PROGRESS_EVERY and processed % PROGRESS_EVERY == 0:
-                elapsed=max(1,(time.time()-start)); rate=processed/elapsed
-                print(f"Progreso: {processed} | Velocidad: {rate:.2f} prod/s", flush=True)
+                print(f"Progreso: {processed}", flush=True)
 
-            page_info = next_page_info(r)
-            if not page_info:
+            # --- decidir siguiente página ---
+            if mode=="page_info":
+              nxt = next_page_info(r)
+              print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next_page_info={bool(nxt)}", flush=True)
+              if nxt:
+                page_info = nxt
+                continue
+              # si no hay Link pero la página trajo 250, pasamos a since_id
+              if len(prods)==250:
+                mode="since"
+                since_id = prods[-1]["id"]
+                print(f"Cambio a paginación since_id desde id={since_id}", flush=True)
+                continue
               print("Fin de paginación.", flush=True); break
+            else:
+              # since_id
+              if len(prods)<250:
+                print("Fin de paginación (since_id).", flush=True); break
+              since_id = prods[-1]["id"]
+              print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next since_id={since_id}", flush=True)
 
-          dur = time.time()-start
-          print(f"FIN • Procesados: {processed} | Saltados: {skipped} | Tiempo: {dur/60:.1f} min", flush=True)
+          print(f"FIN • Procesados: {processed} | Saltados: {skipped}", flush=True)
           PY
