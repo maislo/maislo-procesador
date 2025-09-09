@@ -1,19 +1,28 @@
-name: Maislo First Pass (repair all, robust pagination)
+name: Maislo First Pass (checkpointed, repair all, keepalive)
 
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: "*/30 * * * *"     # opcional durante la primera pasada
+  # Durante la primera pasada, si quieres, activa 1/h:
+  # schedule:
+  #   - cron: "0 * * * *"
+
+permissions:
+  contents: write   # para commitear el checkpoint
 
 concurrency:
-  group: maislo-jobs
-  cancel-in-progress: true
+  group: maislo-first-pass
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
+      - name: Checkout (with write token)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -22,34 +31,65 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Run FIRST PASS (products + variants)
+      - name: Run FIRST PASS (products + variants, compact+dedup, checkpoint)
         env:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
           RATE_LIMIT_SLEEP: "1.7"
-          PROGRESS_EVERY: "50"
+          PROGRESS_EVERY: "10"        # << más frecuente
+          HEARTBEAT_SECONDS: "60"     # << keep-alive cada 60s
           SHOW_EVERY_ITEM: "0"
           PASS_MARK: "full-pass-2"
-          FORCE_REPROCESS: "1"
+          FORCE_REPROCESS: "1"        # rehace TODO en esta primera pasada
+          CHECKPOINT_FILE: ".maislo_since_id.txt"
         run: |
           python - << 'PY'
-          import os, re, time, html, unicodedata, requests
+          import os, re, time, html, unicodedata, subprocess, requests
 
           # ===== Config =====
           SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
           TOKEN = os.environ["SHOP_TOKEN"]
           API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
           RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.7"))
-          PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY","50"))
+          PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY","10"))
+          HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS","60"))
           SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
           PASS_MARK = os.environ.get("PASS_MARK","").strip()
           FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS","0")=="1"
+          CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE",".maislo_since_id.txt")
 
           S = requests.Session()
           S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type":"application/json","Accept":"application/json"})
 
-          # ---------- HTTP helpers ----------
+          # ---------- Git helpers ----------
+          def git(*args):
+            return subprocess.run(["git"]+list(args), check=False, capture_output=True, text=True)
+
+          def save_checkpoint(last_id):
+            try:
+              with open(CHECKPOINT_FILE,"w") as f:
+                f.write(str(last_id))
+              git("config","user.email","bot@maislo")
+              git("config","user.name","Maislo Bot")
+              git("add", CHECKPOINT_FILE)
+              if git("diff","--cached","--quiet").returncode != 0:
+                git("commit","-m",f"checkpoint: {last_id}")
+                git("push")
+                print(f"[checkpoint] Guardado y subido: {last_id}", flush=True)
+            except Exception as e:
+              print(f"[checkpoint] Error al guardar: {e}", flush=True)
+
+          def load_checkpoint():
+            try:
+              if os.path.exists(CHECKPOINT_FILE):
+                with open(CHECKPOINT_FILE) as f:
+                  v = f.read().strip()
+                  return int(v) if v else None
+            except: pass
+            return None
+
+          # ---------- HTTP ----------
           def req(m,u,**k):
             tries=0
             while True:
@@ -77,7 +117,7 @@ jobs:
             m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
             return m.group(1) if m else None
 
-          # ---------- Texto utilidades ----------
+          # ---------- Texto / Parse ----------
           TAG_RE = re.compile(r"<[^>]+>")
           def strip_accents(s): 
             return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
@@ -278,10 +318,14 @@ jobs:
 
           processed=0; skipped=0; page_no=0
           page_info=None
-          mode="page_info"   # cambiará a "since" si no hay Link y aún hay más
-          since_id=None
+          since_id = load_checkpoint()
+          mode = "since" if since_id else "page_info"
+          if since_id:
+            print(f"[checkpoint] Reanudando desde since_id={since_id}", flush=True)
 
-          def fetch_page(page_info=None, since_id=None, mode="page_info", attempt_no=1):
+          last_log = time.time()  # heartbeat base
+
+          def fetch_page(page_info=None, since_id=None, mode="page_info"):
             base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250"
             if mode=="page_info":
               url=base+"&status=any&published_status=any"
@@ -292,8 +336,8 @@ jobs:
             r=req("GET",url); prods=[]
             if r.ok:
               prods=r.json().get("products",[])
-            if not prods and attempt_no==1:
-              # Reintento sin 'status' (algunas tiendas no devuelven nada con status=any)
+            if not prods:
+              # Reintento sin 'status'
               if mode=="page_info":
                 url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250" + (f"&page_info={page_info}" if page_info else "")
               else:
@@ -310,6 +354,7 @@ jobs:
 
             page_no += 1
             print(f"[Página {page_no} • modo={mode}] cargada: {len(prods)} productos", flush=True)
+            last_log = time.time()
 
             for p in prods:
               pid=p["id"]
@@ -325,29 +370,8 @@ jobs:
                 if SHOW_EVERY_ITEM: print(f"SKIP pid={pid} (ya marcado {PASS_MARK})", flush=True)
                 continue
 
-              # ----- rellenado de metacampos y variantes (igual que tenías) -----
-              def html_to_text_lines_compact(source):
-                lines = html_to_lines(source)
-                return compact_kv(lines)
+              gender=guess_gender(tags)
 
-              def normalize_body_and_put(cat, vendor, model, color_opt, gender, p):
-                c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
-                g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
-                b = vendor or "Maislo"; m=model or "Producto"
-                if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
-                elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
-                elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
-                elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
-                elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
-                elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
-                elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
-                else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
-                new_body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
-                current_body = (p.get("body_html") or "").strip()
-                if current_body != new_body.strip():
-                  put_product(pid,{"id":pid,"body_html":new_body})
-
-              gender = guess_gender(tags)
               if vendor: upsert_product_metafield_cached(pid, metas, "custom", "brand", vendor)
 
               model=title.strip()
@@ -360,7 +384,7 @@ jobs:
               body_html = p.get("body_html") or ""
               orig_html = (metas.get("custom.original_description") or {}).get("value") or ""
               tech_source = orig_html if orig_html.strip() else body_html
-              tech_compact = html_to_text_lines_compact(tech_source)
+              tech_compact = compact_kv(html_to_lines(tech_source))
               if tech_compact:
                 upsert_product_metafield_cached(pid, metas, "custom", "tech_description", tech_compact)
 
@@ -371,7 +395,22 @@ jobs:
               if color_opt:
                 upsert_product_metafield_cached(pid, metas, "custom", "color", normalize_color(color_opt))
 
-              normalize_body_and_put(cat, vendor, model, color_opt, gender, p)
+              # Body corto (solo si cambia)
+              c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
+              g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
+              b = vendor or "Maislo"; m=model or "Producto"
+              if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
+              elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
+              elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
+              elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
+              elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
+              elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
+              elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
+              else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
+              new_body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
+              current_body = (p.get("body_html") or "").strip()
+              if current_body != new_body.strip():
+                put_product(pid,{"id":pid,"body_html":new_body})
 
               total_inventory=0
               for v in p.get("variants", []):
@@ -420,30 +459,41 @@ jobs:
                 upsert_product_metafield_cached(pid, metas, "custom", "processed_pass", PASS_MARK)
 
               processed+=1
-              if SHOW_EVERY_ITEM:
-                print(f"#{processed} PID={pid} Procesados: {processed}", flush=True)
-              elif PROGRESS_EVERY and processed % PROGRESS_EVERY == 0:
-                print(f"Progreso: {processed}", flush=True)
 
-            # --- decidir siguiente página ---
+              # --- keep-alive / progreso ---
+              now = time.time()
+              if SHOW_EVERY_ITEM:
+                print(f"#{processed} PID={pid}", flush=True)
+                last_log = now
+              else:
+                if PROGRESS_EVERY and (processed % PROGRESS_EVERY == 0):
+                  print(f"Progreso: {processed}", flush=True)
+                  last_log = now
+                elif now - last_log >= HEARTBEAT_SECONDS:
+                  print(f"HB • processed={processed}", flush=True)
+                  last_log = now
+
+            # --- fin de página: decide siguiente y guarda checkpoint ---
             if mode=="page_info":
               nxt = next_page_info(r)
-              print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next_page_info={bool(nxt)}", flush=True)
+              last_id = prods[-1]["id"]
+              save_checkpoint(last_id)
+              print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next_page_info={bool(nxt)} • last_id={last_id}", flush=True)
               if nxt:
                 page_info = nxt
                 continue
-              # si no hay Link pero la página trajo 250, pasamos a since_id
               if len(prods)==250:
                 mode="since"
-                since_id = prods[-1]["id"]
+                since_id = last_id
                 print(f"Cambio a paginación since_id desde id={since_id}", flush=True)
                 continue
               print("Fin de paginación.", flush=True); break
             else:
-              # since_id
+              last_id = prods[-1]["id"]
+              save_checkpoint(last_id)
               if len(prods)<250:
                 print("Fin de paginación (since_id).", flush=True); break
-              since_id = prods[-1]["id"]
+              since_id = last_id
               print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next since_id={since_id}", flush=True)
 
           print(f"FIN • Procesados: {processed} | Saltados: {skipped}", flush=True)
