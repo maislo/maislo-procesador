@@ -2,16 +2,16 @@ name: Maislo First Pass (checkpointed, repair all, keepalive)
 
 on:
   workflow_dispatch: {}
-  # Durante la primera pasada, si quieres, activa 1/h:
+  # Si quieres que se relance solo mientras dura la primera pasada, descomenta:
   # schedule:
-  #   - cron: "0 * * * *"
+  #   - cron: "0 * * * *"   # cada hora (UTC)
 
 permissions:
-  contents: write   # para commitear el checkpoint
+  contents: write   # necesario para commitear el checkpoint
 
 concurrency:
   group: maislo-first-pass
-  cancel-in-progress: false
+  cancel-in-progress: false   # no cancela si entra otro (se encola)
 
 jobs:
   run:
@@ -36,22 +36,24 @@ jobs:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
-          RATE_LIMIT_SLEEP: "1.7"
-          PROGRESS_EVERY: "10"        # << más frecuente
-          HEARTBEAT_SECONDS: "60"     # << keep-alive cada 60s
+          RATE_LIMIT_SLEEP: "1.8"     # sube si ves 429 (1.8–2.0)
+          PROGRESS_EVERY: "10"        # logs cada 10 productos
+          HEARTBEAT_SECONDS: "60"     # keep-alive cada 60s
           SHOW_EVERY_ITEM: "0"
-          PASS_MARK: "full-pass-2"
-          FORCE_REPROCESS: "1"        # rehace TODO en esta primera pasada
+          PASS_MARK: "full-pass-2"    # marca de pasada
+          FORCE_REPROCESS: "1"        # 1 = rehace TODO en esta primera vuelta
           CHECKPOINT_FILE: ".maislo_since_id.txt"
         run: |
           python - << 'PY'
           import os, re, time, html, unicodedata, subprocess, requests
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
 
           # ===== Config =====
           SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
           TOKEN = os.environ["SHOP_TOKEN"]
           API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
-          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.7"))
+          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.8"))
           PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY","10"))
           HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS","60"))
           SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
@@ -59,10 +61,70 @@ jobs:
           FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS","0")=="1"
           CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE",".maislo_since_id.txt")
 
+          # ===== HTTP Session con reintentos/backoff =====
           S = requests.Session()
-          S.headers.update({"X-Shopify-Access-Token": TOKEN, "Content-Type":"application/json","Accept":"application/json"})
+          S.headers.update({
+            "X-Shopify-Access-Token": TOKEN,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+          })
+          retry = Retry(
+              total=6, connect=6, read=6,
+              backoff_factor=1.5,
+              status_forcelist=[429,500,502,503,504],
+              allowed_methods=frozenset(["GET","POST","PUT","DELETE","PATCH"])
+          )
+          S.mount("https://", HTTPAdapter(max_retries=retry))
+          S.mount("http://", HTTPAdapter(max_retries=retry))
 
-          # ---------- Git helpers ----------
+          def req(method, url, **kwargs):
+            """Peticiones Shopify con timeout largo, reintentos en 429/5xx y timeouts,
+               backoff y respeto del bucket."""
+            timeout = kwargs.pop("timeout", 120)
+            tries = 0
+            while True:
+              try:
+                r = S.request(method, url, timeout=timeout, **kwargs)
+              except requests.exceptions.ReadTimeout:
+                tries += 1
+                wait = min(90, 5 + tries * 5)
+                print(f"ReadTimeout {method} {url} → retry {tries} in {wait}s", flush=True)
+                time.sleep(wait)
+                if tries < 6: continue
+                raise
+              except requests.exceptions.ConnectionError as e:
+                tries += 1
+                wait = min(90, 5 + tries * 5)
+                print(f"ConnError {method} {url}: {e} → retry {tries} in {wait}s", flush=True)
+                time.sleep(wait)
+                if tries < 6: continue
+                raise
+
+              if r.status_code in (429,500,502,503,504):
+                tries += 1
+                ra = r.headers.get("Retry-After")
+                wait = max(RATE_LIMIT_SLEEP, float(ra) if ra else 2 + tries * 1.5)
+                print(f"{r.status_code} {method} {url} → retry {tries} in {wait:.1f}s", flush=True)
+                time.sleep(wait)
+                if tries < 8: continue
+                return r
+
+              bucket = r.headers.get("X-Shopify-Shop-Api-Call-Limit","")
+              try:
+                used,total = [int(x) for x in bucket.split("/")]
+                if used >= total - 2: time.sleep(1.0)
+              except: pass
+
+              time.sleep(RATE_LIMIT_SLEEP)
+              return r
+
+          def next_page_info(resp):
+            link = (resp.headers.get("Link") or "")
+            m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
+            return m.group(1) if m else None
+
+          # ===== Git checkpoint helpers =====
           def git(*args):
             return subprocess.run(["git"]+list(args), check=False, capture_output=True, text=True)
 
@@ -89,37 +151,9 @@ jobs:
             except: pass
             return None
 
-          # ---------- HTTP ----------
-          def req(m,u,**k):
-            tries=0
-            while True:
-              r = S.request(m,u,timeout=60,**k)
-              if r.status_code==429:
-                tries+=1
-                wait = max(1.2, RATE_LIMIT_SLEEP)
-                ra = r.headers.get("Retry-After")
-                if ra:
-                  try: wait = max(wait, float(ra))
-                  except: pass
-                time.sleep(wait)
-                if tries<8: continue
-                return r
-              bucket=r.headers.get("X-Shopify-Shop-Api-Call-Limit","")
-              try:
-                used,total=[int(x) for x in bucket.split("/")]
-                if used>=total-4: time.sleep(1.0)
-              except: pass
-              time.sleep(RATE_LIMIT_SLEEP)
-              return r
-
-          def next_page_info(resp):
-            link = (resp.headers.get("Link") or "")
-            m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
-            return m.group(1) if m else None
-
-          # ---------- Texto / Parse ----------
+          # ===== Texto / parsing =====
           TAG_RE = re.compile(r"<[^>]+>")
-          def strip_accents(s): 
+          def strip_accents(s):
             return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
 
           def html_to_lines(s):
@@ -127,8 +161,7 @@ jobs:
             s = re.sub(r'(?i)<br\s*/?>', '\n', s)
             s = re.sub(r'(?i)</(p|li|div|tr|h[1-6])>', '\n', s)
             s = re.sub(r'(?i)<(p|li|div|tr|h[1-6])[^>]*>', '', s)
-            s = TAG_RE.sub(' ', s)
-            s = s.replace('\r','\n')
+            s = TAG_RE.sub(' ', s).replace('\r','\n')
             lines = [re.sub(r'\s+',' ', ln).strip() for ln in s.split('\n')]
             return [ln for ln in lines if ln]
 
@@ -140,7 +173,6 @@ jobs:
             'altura modelo, cm','modelo lleva una talla','dobladillos'
           }
           label_line_re = re.compile(r'^\s*([^:]{1,60}):\s*$')
-
           def is_label(text):
             base = strip_accents((text or '').lower().strip())
             base = base.replace('made in','hecho en').replace('coleccion','colección')
@@ -168,11 +200,10 @@ jobs:
             for ln in out:
               key = strip_accents(re.sub(r'\s+',' ', ln.lower()).strip())
               if key not in seen:
-                seen.add(key)
-                cleaned.append(ln)
+                seen.add(key); cleaned.append(ln)
             return "\n".join(cleaned).strip()
 
-          # ---------- Normalizadores ----------
+          # ===== Normalizadores =====
           def normalize_brand(v):
             if not v: return ""
             v=re.sub(r"\s{2,}"," ",v.strip())
@@ -224,7 +255,7 @@ jobs:
                 return cat
             return "otros"
 
-          # ---------- Metafields PRODUCTO ----------
+          # ===== Metafields PRODUCTO =====
           PRODUCT_META_TYPE = {
             ("custom","brand"): "single_line_text_field",
             ("custom","model"): "single_line_text_field",
@@ -299,7 +330,7 @@ jobs:
               tags_list.append(tag)
               put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
 
-          # ---------- Conteo aprox ----------
+          # ===== Conteo informativo =====
           def try_count():
             urls=[
               f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any&published_status=any",
@@ -323,7 +354,7 @@ jobs:
           if since_id:
             print(f"[checkpoint] Reanudando desde since_id={since_id}", flush=True)
 
-          last_log = time.time()  # heartbeat base
+          last_log = time.time()
 
           def fetch_page(page_info=None, since_id=None, mode="page_info"):
             base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250"
@@ -460,7 +491,7 @@ jobs:
 
               processed+=1
 
-              # --- keep-alive / progreso ---
+              # keep-alive / progreso
               now = time.time()
               if SHOW_EVERY_ITEM:
                 print(f"#{processed} PID={pid}", flush=True)
@@ -473,7 +504,7 @@ jobs:
                   print(f"HB • processed={processed}", flush=True)
                   last_log = now
 
-            # --- fin de página: decide siguiente y guarda checkpoint ---
+            # fin de página: siguiente + checkpoint
             if mode=="page_info":
               nxt = next_page_info(r)
               last_id = prods[-1]["id"]
