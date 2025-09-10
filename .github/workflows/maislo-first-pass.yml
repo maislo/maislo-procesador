@@ -1,17 +1,16 @@
-name: Maislo First Pass (checkpointed, repair all, keepalive)
+name: Maislo First Pass (checkpointed, time-sliced, debug)
 
 on:
+  schedule:
+    - cron: "*/30 * * * *"   # se ejecuta cada 30 min hasta completar
   workflow_dispatch: {}
-  # Si quieres que se relance solo mientras dura la primera pasada, descomenta:
-  # schedule:
-  #   - cron: "0 * * * *"   # cada hora (UTC)
 
 permissions:
-  contents: write   # necesario para commitear el checkpoint
+  contents: write            # para commitear el checkpoint
 
 concurrency:
   group: maislo-first-pass
-  cancel-in-progress: false   # no cancela si entra otro (se encola)
+  cancel-in-progress: false  # nunca solapa runs; si coincide, queda en cola
 
 jobs:
   run:
@@ -31,18 +30,20 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Run FIRST PASS (products + variants, compact+dedup, checkpoint)
+      - name: FIRST PASS (metafields + variants + body, checkpoint, debug)
         env:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
           SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
-          RATE_LIMIT_SLEEP: "1.8"     # sube si ves 429 (1.8–2.0)
-          PROGRESS_EVERY: "10"        # logs cada 10 productos
-          HEARTBEAT_SECONDS: "60"     # keep-alive cada 60s
-          SHOW_EVERY_ITEM: "0"
-          PASS_MARK: "full-pass-2"    # marca de pasada
-          FORCE_REPROCESS: "1"        # 1 = rehace TODO en esta primera vuelta
+          RATE_LIMIT_SLEEP: "1.8"
+          PROGRESS_EVERY: "10"
+          HEARTBEAT_SECONDS: "60"
+          PASS_MARK: "full-pass-2"
+          FORCE_REPROCESS: "1"          # primera pasada: repara TODO
           CHECKPOINT_FILE: ".maislo_since_id.txt"
+          MAX_SECONDS_PER_RUN: "3000"   # ~50 min de trabajo por run
+          SHOW_EVERY_ITEM: "0"          # pon "1" si quieres imprimir TODOS
+          DEBUG_LIMIT: "50"             # nº de productos a imprimir por run
         run: |
           python - << 'PY'
           import os, re, time, html, unicodedata, subprocess, requests
@@ -56,12 +57,19 @@ jobs:
           RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.8"))
           PROGRESS_EVERY = int(os.environ.get("PROGRESS_EVERY","10"))
           HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS","60"))
-          SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
           PASS_MARK = os.environ.get("PASS_MARK","").strip()
           FORCE_REPROCESS = os.environ.get("FORCE_REPROCESS","0")=="1"
           CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE",".maislo_since_id.txt")
+          MAX_SECONDS_PER_RUN = int(os.environ.get("MAX_SECONDS_PER_RUN","3000"))
+          SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
+          DEBUG_LIMIT = int(os.environ.get("DEBUG_LIMIT","0"))
+          debug_count = 0
 
-          # ===== HTTP Session con reintentos/backoff =====
+          def trunc(s, n=120):
+            s = (s or "").replace("\n"," | ")
+            return (s[:n] + "…") if len(s) > n else s
+
+          # ===== HTTP con retries/backoff =====
           S = requests.Session()
           S.headers.update({
             "X-Shopify-Access-Token": TOKEN,
@@ -79,23 +87,19 @@ jobs:
           S.mount("http://", HTTPAdapter(max_retries=retry))
 
           def req(method, url, **kwargs):
-            """Peticiones Shopify con timeout largo, reintentos en 429/5xx y timeouts,
-               backoff y respeto del bucket."""
             timeout = kwargs.pop("timeout", 120)
             tries = 0
             while True:
               try:
                 r = S.request(method, url, timeout=timeout, **kwargs)
               except requests.exceptions.ReadTimeout:
-                tries += 1
-                wait = min(90, 5 + tries * 5)
+                tries += 1; wait = min(90, 5 + tries * 5)
                 print(f"ReadTimeout {method} {url} → retry {tries} in {wait}s", flush=True)
                 time.sleep(wait)
                 if tries < 6: continue
                 raise
               except requests.exceptions.ConnectionError as e:
-                tries += 1
-                wait = min(90, 5 + tries * 5)
+                tries += 1; wait = min(90, 5 + tries * 5)
                 print(f"ConnError {method} {url}: {e} → retry {tries} in {wait}s", flush=True)
                 time.sleep(wait)
                 if tries < 6: continue
@@ -115,7 +119,6 @@ jobs:
                 used,total = [int(x) for x in bucket.split("/")]
                 if used >= total - 2: time.sleep(1.0)
               except: pass
-
               time.sleep(RATE_LIMIT_SLEEP)
               return r
 
@@ -124,20 +127,17 @@ jobs:
             m = re.search(r'<[^>]*[?&]page_info=([^&>]+)>; rel="next"', link)
             return m.group(1) if m else None
 
-          # ===== Git checkpoint helpers =====
+          # ===== Git checkpoint =====
           def git(*args):
             return subprocess.run(["git"]+list(args), check=False, capture_output=True, text=True)
 
           def save_checkpoint(last_id):
             try:
-              with open(CHECKPOINT_FILE,"w") as f:
-                f.write(str(last_id))
-              git("config","user.email","bot@maislo")
-              git("config","user.name","Maislo Bot")
+              with open(CHECKPOINT_FILE,"w") as f: f.write(str(last_id))
+              git("config","user.email","bot@maislo"); git("config","user.name","Maislo Bot")
               git("add", CHECKPOINT_FILE)
               if git("diff","--cached","--quiet").returncode != 0:
-                git("commit","-m",f"checkpoint: {last_id}")
-                git("push")
+                git("commit","-m",f"checkpoint: {last_id}"); git("push")
                 print(f"[checkpoint] Guardado y subido: {last_id}", flush=True)
             except Exception as e:
               print(f"[checkpoint] Error al guardar: {e}", flush=True)
@@ -284,9 +284,9 @@ jobs:
                 d[f"{m.get('namespace')}.{m.get('key')}"]={"id":m.get("id"),"value":m.get("value"),"type":m.get("type")}
             return d
 
-          def upsert_product_metafield_cached(pid, metas, namespace, key, value):
+          def upsert_product_metafield_cached(pid, metas, namespace, key, value, mtype=None):
             existing=metas.get(f"{namespace}.{key}")
-            desired_type = (existing or {}).get("type") or PRODUCT_META_TYPE.get((namespace,key)) or "single_line_text_field"
+            desired_type = mtype or (existing or {}).get("type") or PRODUCT_META_TYPE.get((namespace,key)) or "single_line_text_field"
             value = sanitize_for_type(value, desired_type)
             if value in (None,"",[]): return
             existing_val = (existing or {}).get("value")
@@ -330,14 +330,13 @@ jobs:
               tags_list.append(tag)
               put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
 
-          # ===== Conteo informativo =====
+          # ===== Info inicial =====
           def try_count():
-            urls=[
+            for u in [
               f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any&published_status=any",
               f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json?status=any",
               f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/count.json"
-            ]
-            for u in urls:
+            ]:
               r=req("GET",u)
               if r.ok:
                 try: return int(r.json().get("count",0))
@@ -351,10 +350,10 @@ jobs:
           page_info=None
           since_id = load_checkpoint()
           mode = "since" if since_id else "page_info"
-          if since_id:
-            print(f"[checkpoint] Reanudando desde since_id={since_id}", flush=True)
+          if since_id: print(f"[checkpoint] Reanudando desde since_id={since_id}", flush=True)
 
-          last_log = time.time()
+          start_run = time.time()
+          last_log = start_run
 
           def fetch_page(page_info=None, since_id=None, mode="page_info"):
             base=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products.json?limit=250"
@@ -379,6 +378,10 @@ jobs:
             return r, prods
 
           while True:
+            if time.time() - start_run >= MAX_SECONDS_PER_RUN:
+              print("Presupuesto de tiempo alcanzado; guardo checkpoint y termino este run.", flush=True)
+              break
+
             r, prods = fetch_page(page_info=page_info, since_id=since_id, mode=mode)
             if not prods:
               print("No hay más productos.", flush=True); break
@@ -398,7 +401,11 @@ jobs:
 
               if PASS_MARK and (metas.get("custom.processed_pass") or {}).get("value")==PASS_MARK and not FORCE_REPROCESS:
                 skipped+=1
-                if SHOW_EVERY_ITEM: print(f"SKIP pid={pid} (ya marcado {PASS_MARK})", flush=True)
+                now=time.time()
+                if PROGRESS_EVERY and skipped % PROGRESS_EVERY == 0:
+                  print(f"SKIP: {skipped}", flush=True); last_log=now
+                elif now - last_log >= HEARTBEAT_SECONDS:
+                  print(f"HB • processed={processed} skipped={skipped}", flush=True); last_log=now
                 continue
 
               gender=guess_gender(tags)
@@ -417,11 +424,24 @@ jobs:
               tech_source = orig_html if orig_html.strip() else body_html
               tech_compact = compact_kv(html_to_lines(tech_source))
               if tech_compact:
-                upsert_product_metafield_cached(pid, metas, "custom", "tech_description", tech_compact)
+                upsert_product_metafield_cached(pid, metas, "custom", "tech_description", tech_compact, mtype="multi_line_text_field")
 
-              existing = ((metas.get("custom.category") or {}).get("value") or "").strip()
-              cat = strip_accents(existing).lower() if existing else detect_category(ptype,tags,title)
+              existing_cat = ((metas.get("custom.category") or {}).get("value") or "").strip()
+              cat = strip_accents(existing_cat).lower() if existing_cat else detect_category(ptype,tags,title)
               upsert_product_metafield_cached(pid, metas, "custom", "category", (cat or "otros").capitalize())
+
+              # ---- DEBUG por producto ----
+              if SHOW_EVERY_ITEM or (DEBUG_LIMIT and debug_count < DEBUG_LIMIT):
+                debug_line = (
+                  f"PID={pid} | {vendor} — {model} | "
+                  f"cat={cat} | gender={gender} | "
+                  f"color={normalize_color(color_opt) if color_opt else '-'} | "
+                  f"variants={len(p.get('variants',[]))} | "
+                  f"tech='{trunc(tech_compact, 120)}'"
+                )
+                print(debug_line, flush=True)
+                debug_count += 1
+              # ----------------------------
 
               if color_opt:
                 upsert_product_metafield_cached(pid, metas, "custom", "color", normalize_color(color_opt))
@@ -443,6 +463,7 @@ jobs:
               if current_body != new_body.strip():
                 put_product(pid,{"id":pid,"body_html":new_body})
 
+              # Variantes
               total_inventory=0
               for v in p.get("variants", []):
                 inv = v.get("inventory_quantity")
@@ -453,17 +474,26 @@ jobs:
                 barcode = v.get("barcode") or ""
                 sku = v.get("sku") or ""
 
+                printed_this_variant = False
+
                 if cap not in (None,""):
                   try:
                     capf=float(cap)
                     if capf <= price:
                       put_variant(vid, {"id": vid, "compare_at_price": None})
+                      if SHOW_EVERY_ITEM or (DEBUG_LIMIT and debug_count <= DEBUG_LIMIT):
+                        print(f"  - v{vid}: compare_at {capf} <= price {price} → limpio compare_at", flush=True)
+                        printed_this_variant = True
                     else:
                       mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
                       payload={"metafield":{"namespace":"custom","key":"msrp","value":str(capf),"type":"number_decimal","owner_resource":"variant","owner_id":vid}}
                       rr=req("POST",mf_url,json=payload)
                       if not rr.ok and rr.status_code!=422:
                         print("metafield variant msrp error",vid,rr.status_code,rr.text)
+                      else:
+                        if SHOW_EVERY_ITEM or (DEBUG_LIMIT and debug_count <= DEBUG_LIMIT):
+                          print(f"  - v{vid}: msrp={capf}", flush=True)
+                          printed_this_variant = True
                       time.sleep(0.15)
                   except Exception:
                     pass
@@ -474,14 +504,25 @@ jobs:
                   rr=req("POST",mf_url,json=payload)
                   if not rr.ok and rr.status_code!=422:
                     print("metafield variant ean error",vid,rr.status_code,rr.text)
+                  elif SHOW_EVERY_ITEM or (DEBUG_LIMIT and debug_count <= DEBUG_LIMIT):
+                    print(f"  - v{vid}: ean={barcode}", flush=True)
+                    printed_this_variant = True
                   time.sleep(0.10)
+
                 if sku:
                   mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
                   payload={"metafield":{"namespace":"custom","key":"mpn","value":sku,"type":"single_line_text_field","owner_resource":"variant","owner_id":vid}}
                   rr=req("POST",mf_url,json=payload)
                   if not rr.ok and rr.status_code!=422:
                     print("metafield variant mpn error",vid,rr.status_code,rr.text)
+                  elif SHOW_EVERY_ITEM or (DEBUG_LIMIT and debug_count <= DEBUG_LIMIT):
+                    print(f"  - v{vid}: mpn={sku}", flush=True)
+                    printed_this_variant = True
                   time.sleep(0.10)
+
+                # Si no imprimimos nada de la variante pero SHOW_EVERY_ITEM está activo:
+                if (SHOW_EVERY_ITEM and not printed_this_variant):
+                  print(f"  - v{vid}: sin cambios", flush=True)
 
               if total_inventory <= 2:
                 add_tag_if_missing(pid, tags, "last-units")
@@ -490,42 +531,37 @@ jobs:
                 upsert_product_metafield_cached(pid, metas, "custom", "processed_pass", PASS_MARK)
 
               processed+=1
-
-              # keep-alive / progreso
-              now = time.time()
-              if SHOW_EVERY_ITEM:
-                print(f"#{processed} PID={pid}", flush=True)
-                last_log = now
-              else:
-                if PROGRESS_EVERY and (processed % PROGRESS_EVERY == 0):
-                  print(f"Progreso: {processed}", flush=True)
-                  last_log = now
-                elif now - last_log >= HEARTBEAT_SECONDS:
-                  print(f"HB • processed={processed}", flush=True)
-                  last_log = now
+              now=time.time()
+              if PROGRESS_EVERY and (processed % PROGRESS_EVERY == 0):
+                print(f"Progreso: {processed}", flush=True); last_log=now
+              elif now - last_log >= HEARTBEAT_SECONDS:
+                print(f"HB • processed={processed}", flush=True); last_log=now
 
             # fin de página: siguiente + checkpoint
+            last_id = prods[-1]["id"]
+            save_checkpoint(last_id)
+
             if mode=="page_info":
               nxt = next_page_info(r)
-              last_id = prods[-1]["id"]
-              save_checkpoint(last_id)
               print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next_page_info={bool(nxt)} • last_id={last_id}", flush=True)
               if nxt:
                 page_info = nxt
-                continue
-              if len(prods)==250:
-                mode="since"
-                since_id = last_id
-                print(f"Cambio a paginación since_id desde id={since_id}", flush=True)
-                continue
-              print("Fin de paginación.", flush=True); break
+              else:
+                if len(prods)==250:
+                  mode="since"; page_info=None
+                  print(f"Cambio a paginación since_id desde id={last_id}", flush=True)
+                  since_id = last_id
+                else:
+                  print("Fin de paginación.", flush=True); break
             else:
-              last_id = prods[-1]["id"]
-              save_checkpoint(last_id)
               if len(prods)<250:
                 print("Fin de paginación (since_id).", flush=True); break
               since_id = last_id
               print(f"[Página {page_no}] COMPLETA • Acumulados: {processed} • next since_id={since_id}", flush=True)
+
+            if time.time() - start_run >= MAX_SECONDS_PER_RUN:
+              print("Presupuesto de tiempo alcanzado tras la página; reanudaré en el próximo run.", flush=True)
+              break
 
           print(f"FIN • Procesados: {processed} | Saltados: {skipped}", flush=True)
           PY
