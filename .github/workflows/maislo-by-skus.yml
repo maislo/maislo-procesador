@@ -1,0 +1,435 @@
+name: Maislo by SKUs (DEV)
+
+on:
+  workflow_dispatch:
+    inputs:
+      skus:
+        description: "SKUs separados por comas (máx. ~50 para pruebas)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Process only the provided SKUs
+        env:
+          SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
+          SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
+          SHOP_API_VERSION: ${{ secrets.SHOP_API_VERSION }}
+          TARGET_SKUS: ${{ github.event.inputs.skus }}
+          RATE_LIMIT_SLEEP: "1.8"
+          HEARTBEAT_SECONDS: "60"
+          SHOW_EVERY_ITEM: "1"   # imprime TODOS (ideal para test)
+        run: |
+          python - << 'PY'
+          import os, re, time, html, unicodedata, requests
+
+          # ===== Config =====
+          SHOP_DOMAIN = os.environ["SHOP_DOMAIN"]
+          TOKEN = os.environ["SHOP_TOKEN"]
+          API_VERSION = os.environ.get("SHOP_API_VERSION","2024-07")
+          RATE_LIMIT_SLEEP = float(os.environ.get("RATE_LIMIT_SLEEP","1.8"))
+          HEARTBEAT_SECONDS = int(os.environ.get("HEARTBEAT_SECONDS","60"))
+          SHOW_EVERY_ITEM = os.environ.get("SHOW_EVERY_ITEM","0")=="1"
+
+          TARGET_SKUS = [s.strip() for s in (os.environ.get("TARGET_SKUS","") or "").split(",") if s.strip()]
+          if not TARGET_SKUS:
+            print("No se han recibido SKUs en TARGET_SKUS. Salgo.")
+            raise SystemExit(1)
+
+          # ===== HTTP con reintentos sencillos =====
+          S = requests.Session()
+          S.headers.update({
+            "X-Shopify-Access-Token": TOKEN,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Connection": "keep-alive",
+          })
+
+          def req(method, url, **kwargs):
+            timeout = kwargs.pop("timeout", 120)
+            tries = 0
+            while True:
+              try:
+                r = S.request(method, url, timeout=timeout, **kwargs)
+              except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+                tries += 1
+                wait = min(90, 5 + tries * 5)
+                print(f"[NET] {e.__class__.__name__} → retry {tries} in {wait}s", flush=True)
+                time.sleep(wait)
+                if tries < 6: continue
+                raise
+
+              if r.status_code in (429,500,502,503,504):
+                tries += 1
+                ra = r.headers.get("Retry-After")
+                wait = max(RATE_LIMIT_SLEEP, float(ra) if ra else 2 + tries * 1.5)
+                print(f"[HTTP {r.status_code}] retry {tries} in {wait:.1f}s: {url}", flush=True)
+                time.sleep(wait)
+                if tries < 8: continue
+              # respetar bucket
+              bucket = r.headers.get("X-Shopify-Shop-Api-Call-Limit","")
+              try:
+                used,total = [int(x) for x in bucket.split("/")]
+                if used >= total - 2: time.sleep(1.0)
+              except: pass
+              time.sleep(RATE_LIMIT_SLEEP)
+              return r
+
+          def gql(query, variables):
+            url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/graphql.json"
+            r=req("POST", url, json={"query":query, "variables":variables})
+            if not r.ok:
+              raise RuntimeError(f"GQL HTTP {r.status_code}: {r.text[:300]}")
+            data=r.json()
+            if "errors" in data:
+              raise RuntimeError(f"GQL errors: {data['errors']}")
+            return data["data"]
+
+          # ===== Utilidades =====
+          TAG_RE = re.compile(r"<[^>]+>")
+          def strip_accents(s):
+            return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
+
+          def html_to_lines(s):
+            s = html.unescape(s or "")
+            s = re.sub(r'(?i)<br\s*/?>', '\n', s)
+            s = re.sub(r'(?i)</(p|li|div|tr|h[1-6])>', '\n', s)
+            s = re.sub(r'(?i)<(p|li|div|tr|h[1-6])[^>]*>', '', s)
+            s = TAG_RE.sub(' ', s).replace('\r','\n')
+            lines = [re.sub(r'\s+',' ', ln).strip() for ln in s.split('\n')]
+            return [ln for ln in lines if ln]
+
+          LABELS = {
+            'genero','género','tipo','cierre','mangas','manga','cuello','material',
+            'composicion','composición','forro','suela','plantilla','tacon','tacón',
+            'ancho','altura','largo','temporada','ajuste','fit','color','talla',
+            'hecho en','made in','coleccion','colección','estampado','cuidado',
+            'altura modelo, cm','modelo lleva una talla','dobladillos'
+          }
+          label_line_re = re.compile(r'^\s*([^:]{1,60}):\s*$')
+          def is_label(text):
+            base = strip_accents((text or '').lower().strip())
+            base = base.replace('made in','hecho en').replace('coleccion','colección')
+            return base in LABELS
+
+          def compact_kv(lines):
+            out=[]; i=0; n=len(lines)
+            while i<n:
+              m = label_line_re.match(lines[i])
+              if m and is_label(m.group(1)):
+                label = m.group(1).strip()
+                vals=[]; j=i+1
+                while j<n:
+                  m2 = label_line_re.match(lines[j])
+                  if m2 and is_label(m2.group(1)): break
+                  vals.append(lines[j]); j+=1
+                value = " ".join(v for v in vals if v).strip()
+                if value: out.append(f"{label}:{value}")
+                i=j
+              else:
+                if ":" in lines[i]:
+                  out.append(re.sub(r'\s*:\s*',':',lines[i].strip()))
+                i+=1
+            seen=set(); cleaned=[]
+            for ln in out:
+              key = strip_accents(re.sub(r'\s+',' ', ln.lower()).strip())
+              if key not in seen:
+                seen.add(key); cleaned.append(ln)
+            return "\n".join(cleaned).strip()
+
+          def normalize_brand(v):
+            if not v: return ""
+            v=re.sub(r"\s{2,}"," ",v.strip())
+            if v.isupper() and len(v)<=6: return v
+            return " ".join([p.capitalize() if p.islower() else p for p in v.split(" ")])
+
+          COLOR_MAP={"negro":"Black","noir":"Black","black":"Black","nero":"Black","blanco":"White","bianco":"White","white":"White","gris":"Gray","grigio":"Gray","grey":"Gray","azul":"Blue","blu":"Blue","bleu":"Blue","rojo":"Red","rosso":"Red","rouge":"Red","verde":"Green","vert":"Green","amarillo":"Yellow","giallo":"Yellow","jaune":"Yellow","naranja":"Orange","arancione":"Orange","marron":"Brown","marrón":"Brown","marrone":"Brown","beige":"Beige","rosa":"Pink","rose":"Pink","fucsia":"Pink","morado":"Purple","viola":"Purple","multicolor":"Multicolor","multi":"Multicolor","varios":"Multicolor"}
+          def normalize_color(v):
+            if not v: return ""
+            vl=strip_accents(v.strip().lower())
+            for t in re.split(r"[\/,\-\s]+",vl):
+              if t in COLOR_MAP: return COLOR_MAP[t]
+            return v.strip().title()
+
+          def extract_color_from_options(p):
+            for opt in p.get("options",[]):
+              name=(opt.get("name") or "").lower()
+              if name in ("color","colour","couleur","colore","coloris"):
+                vals=opt.get("values") or []
+                if vals: return vals[0]
+            return ""
+
+          def guess_gender(tags):
+            t=(tags or "").lower()
+            if any(x in t for x in ["mujer","women","femme","lady"]): return "Mujer"
+            if any(x in t for x in ["hombre","men","homme"]): return "Hombre"
+            if "niña" in t or "girl" in t: return "Niña"
+            if "niño" in t or "boy" in t: return "Niño"
+            return "Unisex"
+
+          KW={
+            "perfumes":["perfume","fragancia","colonia","eau de parfum","eau de toilette","edp","edt","after shave","aftershave","parfum","fragrance","cologne"],
+            "calzado":["zapat","zapato","bota","botin","sandalia","chancla","mocasin","zueco","alpargata","tacon","sneaker","shoe","boot","sandal","loafer","derby","oxford","heel","pump","trainer","chaussure","botte","sandale","mocassin","stivale","scarpa","sandalo"],
+            "bolsos":["bolso","mochila","bandolera","riñonera","rinonera","tote","shopper","clutch","satchel","hobo","bag","backpack","crossbody","handbag","pouch","sac","pochette"],
+            "relojes":["reloj","cronografo","smartwatch","analogico","digital","watch","wristwatch","chronograph","montre","chronographe"],
+            "complementos":["cinturon","cinturón","bufanda","foulard","pañuelo","gorra","sombrero","guante","gafas","sunglasses","cartera","wallet","corbata","tie","pajarita","calcetin","calcetines","medias","diadema","paraguas","umbrella"],
+            "ropa":["camiseta","camisa","polo","jersey","sudadera","pantal","pantalon","vaquero","jean","denim","falda","vestido","short","chaqueta","abrigo","chaleco","mono","top","blusa","leggings","pijama","lenceria","bañador","bikini","parka","trench","blazer","jacket","coat","dress","skirt","hoodie","t-shirt"],
+            "hogar":["hogar","home","bedding","toalla","sabana","sábana","funda","cojin","cojín","edredon","colcha","almohada","manta","cortina","alfombra","duvet","pillow","blanket","curtain","rug"]
+          }
+          NEG={"relojes":["correa","strap","band"],"bolsos":["wallet","cartera"]}
+
+          def detect_category(ptype,tags,title):
+            t=strip_accents(" ".join([ptype or "",tags or "",title or ""]).lower())
+            order=["perfumes","calzado","bolsos","relojes","complementos","ropa","hogar"]
+            for cat in order:
+              kws=[strip_accents(x) for x in KW[cat]]
+              if any(k in t for k in kws):
+                if any(strip_accents(n) in t for n in NEG.get(cat,[])): continue
+                return cat
+            return "otros"
+
+          def gid_to_id(gid):
+            # ej: gid://shopify/Product/1234567890 -> 1234567890
+            return int(gid.rsplit("/",1)[-1])
+
+          # ===== REST helpers =====
+          def get_product(pid):
+            u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}.json"
+            r=req("GET",u)
+            if not r.ok: raise RuntimeError(f"GET product {pid} {r.status_code}: {r.text[:200]}")
+            return r.json().get("product") or {}
+
+          def put_product(pid, payload):
+            u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}.json"
+            r=req("PUT",u,json={"product":payload})
+            if not r.ok: print("update product error",pid,r.status_code,r.text[:200])
+
+          def put_variant(vid, payload):
+            u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/variants/{vid}.json"
+            r=req("PUT",u,json={"variant":payload})
+            if not r.ok: print("update variant error",vid,r.status_code,r.text[:200])
+
+          def get_product_metafields(pid):
+            u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/products/{pid}/metafields.json"
+            r=req("GET",u); d={}
+            if r.ok:
+              for m in r.json().get("metafields",[]):
+                d[f"{m.get('namespace')}.{m.get('key')}"]={"id":m.get("id"),"value":m.get("value"),"type":m.get("type")}
+            return d
+
+          def upsert_product_metafield_cached(pid, metas, namespace, key, value, mtype=None):
+            PRODUCT_META_TYPE = {
+              ("custom","brand"): "single_line_text_field",
+              ("custom","model"): "single_line_text_field",
+              ("custom","gender"): "single_line_text_field",
+              ("custom","category"): "single_line_text_field",
+              ("custom","color"): "single_line_text_field",
+              ("custom","tech_description"): "multi_line_text_field",
+              ("custom","processed_pass"): "single_line_text_field",
+            }
+            def sanitize_for_type(value, mf_type):
+              if value is None: return value
+              if mf_type == "single_line_text_field" and isinstance(value, str):
+                return re.sub(r"\s+", " ", value).strip()[:255]
+              if mf_type == "number_decimal":
+                try: return str(float(value))
+                except: return None
+              return value
+
+            existing=metas.get(f"{namespace}.{key}")
+            desired_type = mtype or (existing or {}).get("type") or PRODUCT_META_TYPE.get((namespace,key)) or "single_line_text_field"
+            value = sanitize_for_type(value, desired_type)
+            if value in (None,"",[]): return
+            existing_val = (existing or {}).get("value")
+            if isinstance(existing_val,str) and isinstance(value,str):
+              a = re.sub(r'\s+',' ', existing_val).strip()
+              b = re.sub(r'\s+',' ', value).strip()
+              if a == b: return
+            if existing and existing.get("id"):
+              mid=existing["id"]
+              u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields/{mid}.json"
+              payload={"metafield":{"id":mid,"value":value}}
+              if existing.get("type"): payload["metafield"]["type"]=existing["type"]
+              r=req("PUT",u,json=payload)
+              if not r.ok: print("metafield PUT error",pid,namespace,key,r.status_code,r.text[:200])
+              else: metas[f"{namespace}.{key}"]["value"]=value
+              return
+            u=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
+            payload={"metafield":{
+              "namespace":namespace,"key":key,"value":value,"type":desired_type,
+              "owner_resource":"product","owner_id":pid
+            }}
+            r=req("POST",u,json=payload)
+            if not r.ok and r.status_code!=422:
+              print("metafield POST error",pid,namespace,key,r.status_code,r.text[:200])
+            else:
+              metas[f"{namespace}.{key}"]={"id": None, "value": value, "type": desired_type}
+
+          def add_tag_if_missing(pid, current_tags: str, tag: str):
+            tags_list=[t.strip() for t in (current_tags or "").split(",") if t.strip()]
+            if tag not in tags_list:
+              tags_list.append(tag)
+              put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
+
+          # ===== Busca producto por SKU (GraphQL) =====
+          GQL = """
+          query($q:String!, $first:Int!) {
+            productVariants(first:$first, query:$q) {
+              edges {
+                node {
+                  id
+                  sku
+                  product { id }
+                }
+              }
+            }
+          }
+          """
+
+          processed = 0
+          start = time.time(); last_log = start
+
+          for sku in TARGET_SKUS:
+            print(f"\n=== SKU: {sku} ===", flush=True)
+            try:
+              data = gql(GQL, {"q": f"sku:{sku}", "first": 10})
+              edges = data["productVariants"]["edges"]
+              if not edges:
+                print(f"[WARN] No se encontró variante con SKU '{sku}'", flush=True)
+                continue
+              # Tomamos el primer match (si hay varios con mismo SKU)
+              v_node = edges[0]["node"]
+              pid = gid_to_id(v_node["product"]["id"])
+              product = get_product(pid)
+
+              vendor=normalize_brand(product.get("vendor") or "")
+              title=product.get("title") or ""
+              tags=product.get("tags") or ""
+              ptype=product.get("product_type") or ""
+              color_opt=extract_color_from_options(product)
+              gender=guess_gender(tags)
+              metas = get_product_metafields(pid)
+
+              # Metacampos producto
+              if vendor: upsert_product_metafield_cached(pid, metas, "custom", "brand", vendor)
+              model=title.strip()
+              if vendor and model.lower().startswith(vendor.lower()): model=model[len(vendor):].strip()
+              if vendor: model=re.sub(re.escape(vendor), "", model, flags=re.I).strip()
+              model=re.sub(r"\s{2,}"," ",model) or title
+              upsert_product_metafield_cached(pid, metas, "custom", "model", model)
+              upsert_product_metafield_cached(pid, metas, "custom", "gender", gender)
+
+              body_html = product.get("body_html") or ""
+              orig_html = (metas.get("custom.original_description") or {}).get("value") or ""
+              tech_source = orig_html if orig_html.strip() else body_html
+              tech_compact = compact_kv(html_to_lines(tech_source))
+              if tech_compact:
+                upsert_product_metafield_cached(pid, metas, "custom", "tech_description", tech_compact, mtype="multi_line_text_field")
+
+              existing_cat = ((metas.get("custom.category") or {}).get("value") or "").strip()
+              cat = strip_accents(existing_cat).lower() if existing_cat else detect_category(ptype,tags,title)
+              upsert_product_metafield_cached(pid, metas, "custom", "category", (cat or "otros").capitalize())
+
+              if color_opt:
+                upsert_product_metafield_cached(pid, metas, "custom", "color", normalize_color(color_opt))
+
+              # DEBUG por producto
+              def trunc(s, n=120):
+                s = (s or "").replace("\n"," | ")
+                return (s[:n] + "…") if len(s) > n else s
+              print(f"PID={pid} | {vendor} — {model} | cat={cat} | gender={gender} | color={normalize_color(color_opt) if color_opt else '-'} | variants={len(product.get('variants',[]))} | tech='{trunc(tech_compact, 120)}'", flush=True)
+
+              # Body corto (solo si cambia)
+              c_txt=f" en color {normalize_color(color_opt)}" if color_opt else ""
+              g_txt=f" ({gender})" if gender and gender!="Unisex" else ""
+              b = vendor or "Maislo"; m=model or "Producto"
+              if cat=="calzado": line=f"{m or 'Calzado'} de {b}{c_txt}{g_txt}. Diseño actual y versátil."
+              elif cat=="bolsos": line=f"{m or 'Bolso'} de {b}{c_txt}{g_txt}. Práctico y con estilo."
+              elif cat=="relojes": line=f"{m or 'Reloj'} de {b}{g_txt}{c_txt}. Detalle que eleva cualquier look."
+              elif cat=="ropa": line=f"{m or 'Prenda'} de {b}{c_txt}{g_txt}. Fácil de combinar."
+              elif cat=="complementos": line=f"{m or 'Accesorio'} de {b}{c_txt}{g_txt}. Toque final para tu outfit."
+              elif cat=="hogar": line=f"{m or 'Artículo para el hogar'} de {b}{c_txt}. Confort y calidad."
+              elif cat=="perfumes": line=f"{m or 'Fragancia'} de {b}. Aromas originales a precio outlet."
+              else: line=f"{m or 'Producto'} de {b}{c_txt}{g_txt}."
+              new_body=f"<p>{line} Auténtico outlet 100% original. Stock limitado.</p>"
+              current_body = (product.get("body_html") or "").strip()
+              if current_body != new_body.strip():
+                put_product(pid,{"id":pid,"body_html":new_body})
+
+              # Variantes (de TODO el producto)
+              total_inventory=0
+              for v in product.get("variants", []):
+                inv = v.get("inventory_quantity")
+                if isinstance(inv,int): total_inventory += inv
+                vid = v["id"]
+                price = float(v.get("price") or 0)
+                cap = v.get("compare_at_price")
+                barcode = v.get("barcode") or ""
+                sku_v = v.get("sku") or ""
+
+                if cap not in (None,""):
+                  try:
+                    capf=float(cap)
+                    if capf <= price:
+                      put_variant(vid, {"id": vid, "compare_at_price": None})
+                      print(f"  - v{vid}: compare_at {capf} <= price {price} → limpio compare_at", flush=True)
+                    else:
+                      mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
+                      payload={"metafield":{"namespace":"custom","key":"msrp","value":str(capf),"type":"number_decimal","owner_resource":"variant","owner_id":vid}}
+                      rr=req("POST",mf_url,json=payload)
+                      if not rr.ok and rr.status_code!=422:
+                        print("metafield variant msrp error",vid,rr.status_code,rr.text[:160])
+                      else:
+                        print(f"  - v{vid}: msrp={capf}", flush=True)
+                      time.sleep(0.15)
+                  except Exception:
+                    pass
+
+                if barcode:
+                  mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
+                  payload={"metafield":{"namespace":"custom","key":"ean","value":barcode,"type":"single_line_text_field","owner_resource":"variant","owner_id":vid}}
+                  rr=req("POST",mf_url,json=payload)
+                  if not rr.ok and rr.status_code!=422:
+                    print("metafield variant ean error",vid,rr.status_code,rr.text[:160])
+                  else:
+                    print(f"  - v{vid}: ean={barcode}", flush=True)
+                  time.sleep(0.10)
+
+                if sku_v:
+                  mf_url=f"https://{SHOP_DOMAIN}/admin/api/{API_VERSION}/metafields.json"
+                  payload={"metafield":{"namespace":"custom","key":"mpn","value":sku_v,"type":"single_line_text_field","owner_resource":"variant","owner_id":vid}}
+                  rr=req("POST",mf_url,json=payload)
+                  if not rr.ok and rr.status_code!=422:
+                    print("metafield variant mpn error",vid,rr.status_code,rr.text[:160])
+                  else:
+                    print(f"  - v{vid}: mpn={sku_v}", flush=True)
+                  time.sleep(0.10)
+
+              if total_inventory <= 2:
+                add_tag_if_missing(pid, tags, "last-units")
+
+              processed += 1
+              now = time.time()
+              if now - last_log >= HEARTBEAT_SECONDS:
+                print(f"HB • processed={processed}", flush=True)
+                last_log = now
+
+            except Exception as e:
+              print(f"[ERROR SKU {sku}] {e}", flush=True)
+
+          print(f"\nFIN • Productos procesados (por SKU): {processed}", flush=True)
+          PY
