@@ -1,10 +1,10 @@
-name: Maislo by SKUs (DEV)
+name: Maislo by SKUs (DEV, dedup + debug)
 
 on:
   workflow_dispatch:
     inputs:
       skus:
-        description: "SKUs separados por comas (máx. ~50 para pruebas)"
+        description: "SKUs separados por comas (pueden ser de variantes; dedup por producto)"
         required: true
         type: string
 
@@ -24,7 +24,7 @@ jobs:
       - name: Install deps
         run: pip install requests
 
-      - name: Process only the provided SKUs
+      - name: Process only provided SKUs
         env:
           SHOP_DOMAIN: ${{ secrets.SHOP_DOMAIN }}
           SHOP_TOKEN:  ${{ secrets.SHOP_TOKEN }}
@@ -32,7 +32,7 @@ jobs:
           TARGET_SKUS: ${{ github.event.inputs.skus }}
           RATE_LIMIT_SLEEP: "1.8"
           HEARTBEAT_SECONDS: "60"
-          SHOW_EVERY_ITEM: "1"   # imprime TODOS (ideal para test)
+          SHOW_EVERY_ITEM: "1"   # imprime TODO (ideal pruebas)
         run: |
           python - << 'PY'
           import os, re, time, html, unicodedata, requests
@@ -50,7 +50,7 @@ jobs:
             print("No se han recibido SKUs en TARGET_SKUS. Salgo.")
             raise SystemExit(1)
 
-          # ===== HTTP con reintentos sencillos =====
+          # ===== HTTP con reintentos =====
           S = requests.Session()
           S.headers.update({
             "X-Shopify-Access-Token": TOKEN,
@@ -80,6 +80,7 @@ jobs:
                 print(f"[HTTP {r.status_code}] retry {tries} in {wait:.1f}s: {url}", flush=True)
                 time.sleep(wait)
                 if tries < 8: continue
+
               # respetar bucket
               bucket = r.headers.get("X-Shopify-Shop-Api-Call-Limit","")
               try:
@@ -99,7 +100,7 @@ jobs:
               raise RuntimeError(f"GQL errors: {data['errors']}")
             return data["data"]
 
-          # ===== Utilidades =====
+          # ===== Texto / parsing =====
           TAG_RE = re.compile(r"<[^>]+>")
           def strip_accents(s):
             return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c)!="Mn")
@@ -151,6 +152,7 @@ jobs:
                 seen.add(key); cleaned.append(ln)
             return "\n".join(cleaned).strip()
 
+          # ===== Normalizadores y helpers =====
           def normalize_brand(v):
             if not v: return ""
             v=re.sub(r"\s{2,}"," ",v.strip())
@@ -203,7 +205,6 @@ jobs:
             return "otros"
 
           def gid_to_id(gid):
-            # ej: gid://shopify/Product/1234567890 -> 1234567890
             return int(gid.rsplit("/",1)[-1])
 
           # ===== REST helpers =====
@@ -285,7 +286,7 @@ jobs:
               tags_list.append(tag)
               put_product(pid, {"id": pid, "tags": ", ".join(tags_list)})
 
-          # ===== Busca producto por SKU (GraphQL) =====
+          # ===== Busca producto por SKU de variante (GraphQL) =====
           GQL = """
           query($q:String!, $first:Int!) {
             productVariants(first:$first, query:$q) {
@@ -301,6 +302,7 @@ jobs:
           """
 
           processed = 0
+          processed_pids = set()
           start = time.time(); last_log = start
 
           for sku in TARGET_SKUS:
@@ -311,9 +313,15 @@ jobs:
               if not edges:
                 print(f"[WARN] No se encontró variante con SKU '{sku}'", flush=True)
                 continue
-              # Tomamos el primer match (si hay varios con mismo SKU)
+
               v_node = edges[0]["node"]
-              pid = gid_to_id(v_node["product"]["id"])
+              pid = int(v_node["product"]["id"].rsplit("/",1)[-1])
+
+              if pid in processed_pids:
+                print(f"[SKIP] PID {pid} ya procesado en esta ejecución (SKU {sku})", flush=True)
+                continue
+              processed_pids.add(pid)
+
               product = get_product(pid)
 
               vendor=normalize_brand(product.get("vendor") or "")
